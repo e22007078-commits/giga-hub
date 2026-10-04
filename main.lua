@@ -1,3 +1,24 @@
+--[[
+	GIGAMENU v2.0 — by zyru
+	Кастомизация самоката Kukirin G4  (workspace["Kukirin G4"])
+	Тип: LocalScript  ->  StarterPlayer > StarterPlayerScripts
+
+	  F           вилли вкл/выкл  (синхронно с переключателем Auto Wheelie [F])
+	  Shift       заморозить / разморозить самокат (пока сидишь на нём)
+	  RightShift  показать / спрятать меню
+	  "—"         свернуть меню в полоску,  "X" — скрыть
+
+	Страницы:
+	  Presets        готовые пресеты
+	  Customization  вилли, фриз, вилли-бар (ADD), трейл, Rainbow Kukirin G4, цвета
+	  Underglow      подсветка снизу (без видимого блока — только свет)
+	  Test           список деталей самоката: клик = подсветка на самокате + смена цвета
+	  Test2          PUBLIC / PRIVATE пресеты и Cloud key (поделиться темой с другом)
+
+	Если что-то красится не то — смотри Output (F9): скрипт сам печатает,
+	как разложил детали по группам. Имена можно вписать в PART_NAMES.
+]]
+
 local Players      = game:GetService("Players")
 local UIS          = game:GetService("UserInputService")
 local RS           = game:GetService("RunService")
@@ -23,21 +44,19 @@ local CONFIG = {
 	SCOOTER_NAME = "Kukirin G4",
 
 	WHEELIE_KEY  = Enum.KeyCode.F,
+	FREEZE_KEY   = Enum.KeyCode.J,
 	MENU_KEY     = Enum.KeyCode.RightShift,
 	WHEELIE_HOLD = false,  -- true = вилли пока держишь клавишу, false = вкл/выкл по нажатию
 
-	WHEELIE_ANGLE = 70,    -- градусов
-	WHEELIE_POWER = 8,
+	WHEELIE_ANGLE = 65,    -- градусов
+	WHEELIE_POWER = 6,
 	WHEELIE_RAMP  = 80,    -- град/сек
 
 	-- Куда у PrimaryPart смотрит "нос" (локальные координаты).
-	-- Используется, только если AUTO_FORWARD не смог определить направление сам.
 	-- Если вместо вилли самокат задирает ЗАД — Vector3.new(0, 0, 1).
 	FORWARD_LOCAL = Vector3.new(0, 0, -1),
-	AUTO_FORWARD  = true,  -- определять "перед" по колёсам и рулю
 
-	-- на время вилли отключать BodyGyro / AlignOrientation самоката (они держат его ровно)
-	DISABLE_STABILIZERS = true,
+	RIDE_RADIUS = 8,         -- если нет сиденья/сварки: считаем что ты "на самокате", когда ближе стадов
 
 	UNDERGLOW_HEIGHT = 0.08, -- высота источника света (доля высоты модели)
 	GLOW_BRIGHTNESS  = 4,
@@ -71,14 +90,12 @@ local GROUP_SET = {}
 for _, g in ipairs(GROUP_ORDER) do GROUP_SET[g] = true end
 
 local KEYWORDS = {
-	WheelieBar = {"wheeliebar", "wheelie_bar", "wheelie bar"},
+	WheelieBar = {"wheelie"},
 	Wheel      = {"wheel", "tire", "tyre", "rim"},
 	Suspension = {"suspension", "shock", "spring", "fork"},
 	Handlebar  = {"handlebar", "handle", "steer", "grip"},
 	Frame      = {"frame", "body", "deck", "chassis", "stem"},
 }
-
-local BAR_FOLDER = "WheelieBarAdded"
 
 ---------------------------------------------------------------
 -- СОСТОЯНИЕ
@@ -97,7 +114,9 @@ local state = {
 
 local settings = {stretch = false}
 local rainbow  = {}                -- [цель] = true  (All / Trail / Underglow / Smoke / группа)
-local wheelie  = {on = false, target = 0, stab = {}}
+local wheelie  = {on = false, target = 0}
+local freeze   = {on = false, saved = {}}
+local riding   = false
 
 local conns = {}
 local function connect(signal, fn)
@@ -108,11 +127,8 @@ end
 
 -- то, что определяется ниже (GUI), но нужно раньше
 local notify, updateStatus, refreshTestList, closeTestPanel
-local wheelieToggleUI, wbButtonUpdate
+local wheelieToggleUI, freezeToggleUI, wbButtonUpdate
 local testVisible = false
-
--- "перед" самоката в локальных координатах rootPart (обновляется при сканировании)
-local FWD = CONFIG.FORWARD_LOCAL
 
 local function getHumanoid()
 	local c = player.Character
@@ -265,8 +281,6 @@ local function isFx(obj)
 end
 
 local function classify(part)
-	-- детали, которые добавили мы (кнопка ADD), всегда считаются вилли-баром
-	if part.Parent and part.Parent.Name == BAR_FOLDER then return "WheelieBar" end
 	for _, g in ipairs(GROUP_ORDER) do
 		for _, n in ipairs(PART_NAMES[g]) do
 			if part.Name == n then return g end
@@ -362,72 +376,6 @@ local function getScooter()
 	return scooter
 end
 
--- Определяем, куда у самоката "перед": нос = колесо, которое ближе к рулю.
-local function detectForward()
-	local root = rootPart
-	if not root then return nil end
-	local wheels = groups.Wheel
-	if #wheels < 2 then return nil end
-
-	local first = wheels[1]
-	local endA, d1 = first, -1
-	for _, w in ipairs(wheels) do
-		local d = (w.Position - first.Position).Magnitude
-		if d > d1 then endA, d1 = w, d end
-	end
-	local endB, d2 = endA, -1
-	for _, w in ipairs(wheels) do
-		local d = (w.Position - endA.Position).Magnitude
-		if d > d2 then endB, d2 = w, d end
-	end
-	if d2 < 0.8 then return nil end
-
-	local cA, nA, cB, nB = Vector3.zero, 0, Vector3.zero, 0
-	for _, w in ipairs(wheels) do
-		if (w.Position - endA.Position).Magnitude <= (w.Position - endB.Position).Magnitude then
-			cA = cA + w.Position
-			nA += 1
-		else
-			cB = cB + w.Position
-			nB += 1
-		end
-	end
-	if nA == 0 or nB == 0 then return nil end
-	cA = cA / nA
-	cB = cB / nB
-
-	-- руль (или вилка) — ориентир переда
-	local ref
-	for _, g in ipairs({"Handlebar", "Suspension"}) do
-		local list = groups[g]
-		if #list > 0 then
-			local c = Vector3.zero
-			for _, p in ipairs(list) do c = c + p.Position end
-			ref = c / #list
-			break
-		end
-	end
-	if not ref then return nil end
-
-	local front, rear
-	if (cA - ref).Magnitude < (cB - ref).Magnitude then
-		front, rear = cA, cB
-	else
-		front, rear = cB, cA
-	end
-
-	local lv = root.CFrame:VectorToObjectSpace(front - rear)
-	lv = Vector3.new(lv.X, 0, lv.Z)
-	if lv.Magnitude < 0.3 then return nil end
-	local ax, az = math.abs(lv.X), math.abs(lv.Z)
-	if az > ax * 3 then
-		return Vector3.new(0, 0, az / lv.Z)
-	elseif ax > az * 3 then
-		return Vector3.new(ax / lv.X, 0, 0)
-	end
-	return lv.Unit
-end
-
 local function rescan()
 	for _, g in ipairs(GROUP_ORDER) do groups[g] = {} end
 	unclassified, allParts, partsByKey, keyList = {}, {}, {}, {}
@@ -463,10 +411,7 @@ local function rescan()
 			end
 			table.insert(bucket, obj)
 			local vol = obj.Size.X * obj.Size.Y * obj.Size.Z
-			-- вилли-бар (наш) не может быть корневой деталью
-			if vol > biggestVol and obj.Parent and obj.Parent.Name ~= BAR_FOLDER then
-				biggest, biggestVol = obj, vol
-			end
+			if vol > biggestVol then biggest, biggestVol = obj, vol end
 		end
 	end
 	table.sort(keyList)
@@ -482,16 +427,9 @@ local function rescan()
 		end
 	end
 
-	-- куда у самоката "перед"
-	FWD = CONFIG.FORWARD_LOCAL
-	if CONFIG.AUTO_FORWARD then
-		local f = detectForward()
-		if f then FWD = f end
-	end
-
 	-- фаза радуги: позиция детали вдоль самоката
 	if rootPart then
-		local f = FWD
+		local f = CONFIG.FORWARD_LOCAL
 		local dist, lo, hi = {}, math.huge, -math.huge
 		for _, p in ipairs(allParts) do
 			local v = rootPart.CFrame:PointToObjectSpace(p.Position):Dot(f)
@@ -556,7 +494,6 @@ local function debugPrint()
 	ensure()
 	print("[GIGAMENU] scooter:", scooter and scooter:GetFullName() or "НЕ НАЙДЕН (проверь CONFIG.SCOOTER_NAME)")
 	print("[GIGAMENU] root part:", rootPart and rootPart:GetFullName() or "nil")
-	print("[GIGAMENU] перед (локально):", FWD, CONFIG.AUTO_FORWARD and "(авто)" or "(CONFIG.FORWARD_LOCAL)")
 	for _, g in ipairs(GROUP_ORDER) do
 		local names = {}
 		for _, p in ipairs(groups[g]) do table.insert(names, p.Name) end
@@ -584,33 +521,72 @@ local function groupDisplayColor(g)
 end
 
 ---------------------------------------------------------------
--- ГРАНИЦЫ МОДЕЛИ в локальных координатах root (для вилли-бара и андерглоу)
+-- "НА САМОКАТЕ?" и ЗАМОРОЗКА (Shift)
 ---------------------------------------------------------------
-local function localBounds(root, model)
-	local minV = Vector3.new(math.huge, math.huge, math.huge)
-	local maxV = Vector3.new(-math.huge, -math.huge, -math.huge)
-	local list = model:GetDescendants()
-	if model:IsA("BasePart") then table.insert(list, model) end
-	for _, p in ipairs(list) do
-		if p:IsA("BasePart") and not isFx(p) and not (p.Parent and p.Parent.Name == BAR_FOLDER) then
-			local rel = root.CFrame:ToObjectSpace(p.CFrame)
-			local h = p.Size / 2
-			for _, sx in ipairs({-1, 1}) do
-				for _, sy in ipairs({-1, 1}) do
-					for _, sz in ipairs({-1, 1}) do
-						local c = rel * Vector3.new(h.X * sx, h.Y * sy, h.Z * sz)
-						minV = Vector3.new(math.min(minV.X, c.X), math.min(minV.Y, c.Y), math.min(minV.Z, c.Z))
-						maxV = Vector3.new(math.max(maxV.X, c.X), math.max(maxV.Y, c.Y), math.max(maxV.Z, c.Z))
-					end
-				end
-			end
+local function isRiding()
+	local s = scooter
+	local char = player.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not (s and char and hrp) then return false end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local seat = hum and hum.SeatPart
+	if seat and seat:IsDescendantOf(s) then return true end
+	local root = rootPart
+	if not root then return false end
+	local ok, parts = pcall(function() return root:GetConnectedParts(true) end)
+	if ok then
+		for _, p in ipairs(parts) do
+			if p:IsDescendantOf(char) then return true end
 		end
 	end
-	return minV, maxV
+	return (hrp.Position - root.Position).Magnitude <= CONFIG.RIDE_RADIUS
+end
+
+local function resetFreezeState()
+	freeze.on = false
+	freeze.saved = {}
+	if freezeToggleUI then freezeToggleUI.set(false) end
+end
+
+-- возвращает true, если состояние стало таким, как просили
+local function setFreeze(on)
+	if on == freeze.on then return true end
+	if on then
+		ensure()
+		if not rootPart or not isRiding() then return false end
+		freeze.saved = {}
+		for _, p in ipairs(allParts) do
+			if p.Parent then
+				freeze.saved[p] = p.Anchored
+				p.AssemblyLinearVelocity = Vector3.zero
+				p.AssemblyAngularVelocity = Vector3.zero
+				p.Anchored = true
+			end
+		end
+		freeze.on = true
+	else
+		for p, was in pairs(freeze.saved) do
+			if p.Parent then p.Anchored = was end
+		end
+		freeze.saved = {}
+		freeze.on = false
+	end
+	if freezeToggleUI then freezeToggleUI.set(freeze.on) end
+	return true
+end
+
+local function checkFreeze()
+	local hum = getHumanoid()
+	local char = player.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hum or hum.Health <= 0 or not hrp or not rootPart
+		or (hrp.Position - rootPart.Position).Magnitude > 40 then
+		setFreeze(false)
+	end
 end
 
 ---------------------------------------------------------------
--- ВИЛЛИ-БАР (кнопка ADD): две распорки назад от заднего колеса + ролик-перекладина
+-- ВИЛЛИ-БАР (кнопка ADD): две распорки назад от заднего колеса + перекладина
 ---------------------------------------------------------------
 local function newBarPart(folder, root, localCF, size)
 	local p = Instance.new("Part")
@@ -620,7 +596,6 @@ local function newBarPart(folder, root, localCF, size)
 	p.Color = RGB(28, 28, 30)
 	p.TopSurface = Enum.SurfaceType.Smooth
 	p.BottomSurface = Enum.SurfaceType.Smooth
-	p.Anchored = false
 	p.CanCollide = CONFIG.WHEELIE_BAR_COLLIDE
 	p.CanQuery = false
 	p.CanTouch = false
@@ -638,33 +613,29 @@ local function buildWheelieBar()
 	ensure()
 	local root, s = rootPart, scooter
 	if not root or not s then return false end
-	local old = s:FindFirstChild(BAR_FOLDER)
+	local old = s:FindFirstChild("WheelieBarAdded")
 	if old then old:Destroy() end
 
-	local fwd = root.CFrame:VectorToWorldSpace(FWD)
+	local fwd = root.CFrame:VectorToWorldSpace(CONFIG.FORWARD_LOCAL)
 	local rear = getRearWheel(fwd)
-	local back = -FWD.Unit
-	local side = FWD:Cross(Vector3.yAxis).Unit
+	local back = -CONFIG.FORWARD_LOCAL.Unit
+	local side = CONFIG.FORWARD_LOCAL:Cross(Vector3.yAxis).Unit
 	local center, r, halfW
 	if rear then
 		center = root.CFrame:PointToObjectSpace(rear.Position)
 		r = math.max(rear.Size.X, rear.Size.Y, rear.Size.Z) / 2
 		halfW = math.min(rear.Size.X, rear.Size.Y, rear.Size.Z) / 2 + 0.2
 	else
-		local minV, maxV = localBounds(root, s)
-		local size = maxV - minV
-		local mid = (minV + maxV) / 2
-		local half = math.abs(back.X) * size.X / 2 + math.abs(back.Z) * size.Z / 2
-		center = Vector3.new(mid.X, minV.Y + 0.4, mid.Z) + back * half
+		center = back * (math.max(root.Size.X, root.Size.Z) / 2) + Vector3.new(0, -root.Size.Y / 2 + 0.4, 0)
 		r, halfW = 0.4, 0.4
 	end
 
-	local t = math.clamp(r * 0.18, 0.08, 0.25)
+	local t = math.clamp(r * 0.18, 0.06, 0.2)
 	local a = center + back * (r * 0.4) + Vector3.new(0, r * 0.35, 0)
-	local b = center + back * (r * 1.9) + Vector3.new(0, -r * 0.75, 0)
+	local b = center + back * (r * 1.9) + Vector3.new(0, -r * 0.6, 0)
 
 	local folder = Instance.new("Folder")
-	folder.Name = BAR_FOLDER
+	folder.Name = "WheelieBarAdded"
 	folder.Parent = s
 
 	for _, sgn in ipairs({-1, 1}) do
@@ -673,11 +644,7 @@ local function buildWheelieBar()
 		local len = (B - A).Magnitude
 		newBarPart(folder, root, CFrame.lookAt((A + B) / 2, B), Vector3.new(t, t, len))
 	end
-
-	-- ролик на конце (ось вдоль самоката поперёк)
-	local roller = newBarPart(folder, root, CFrame.fromMatrix(b, side, Vector3.yAxis),
-		Vector3.new(halfW * 2 + t, t * 3, t * 3))
-	roller.Shape = Enum.PartType.Cylinder
+	newBarPart(folder, root, CFrame.lookAt(b, b + side), Vector3.new(t * 1.4, t * 1.4, halfW * 2 + t))
 
 	dirty = true -- пересканируем: новые детали попадут в группу WheelieBar и сразу покрасятся
 	return true
@@ -696,6 +663,29 @@ end
 local function setGlowColorRaw(c)
 	if glow.point   then glow.point.Color = c end
 	if glow.surface then glow.surface.Color = c end
+end
+
+local function localBounds(root, model)
+	local minV = Vector3.new(math.huge, math.huge, math.huge)
+	local maxV = Vector3.new(-math.huge, -math.huge, -math.huge)
+	local list = model:GetDescendants()
+	if model:IsA("BasePart") then table.insert(list, model) end
+	for _, p in ipairs(list) do
+		if p:IsA("BasePart") and not isFx(p) then
+			local rel = root.CFrame:ToObjectSpace(p.CFrame)
+			local h = p.Size / 2
+			for _, sx in ipairs({-1, 1}) do
+				for _, sy in ipairs({-1, 1}) do
+					for _, sz in ipairs({-1, 1}) do
+						local c = rel * Vector3.new(h.X * sx, h.Y * sy, h.Z * sz)
+						minV = Vector3.new(math.min(minV.X, c.X), math.min(minV.Y, c.Y), math.min(minV.Z, c.Z))
+						maxV = Vector3.new(math.max(maxV.X, c.X), math.max(maxV.Y, c.Y), math.max(maxV.Z, c.Z))
+					end
+				end
+			end
+		end
+	end
+	return minV, maxV
 end
 
 local function buildGlow()
@@ -766,7 +756,7 @@ local function buildTrail()
 	local root = getRoot()
 	if not root then return end
 
-	local fwd = root.CFrame:VectorToWorldSpace(FWD)
+	local fwd = root.CFrame:VectorToWorldSpace(CONFIG.FORWARD_LOCAL)
 	local rear = getRearWheel(fwd)
 	local localPos, r, width
 	if rear then
@@ -774,14 +764,14 @@ local function buildTrail()
 		r = math.max(rear.Size.X, rear.Size.Y, rear.Size.Z) / 2
 		width = math.clamp(math.min(rear.Size.X, rear.Size.Y, rear.Size.Z) * 2.5, 0.8, 3)
 	else
-		localPos = -FWD * (math.max(root.Size.X, root.Size.Z) / 2) + Vector3.new(0, -root.Size.Y / 2, 0)
+		localPos = -CONFIG.FORWARD_LOCAL * (math.max(root.Size.X, root.Size.Z) / 2) + Vector3.new(0, -root.Size.Y / 2, 0)
 		r = 0.3
 		width = 1
 	end
 	width = CONFIG.TRAIL_WIDTH or width
 
 	-- поперёк самоката (локальная "правая" ось) -> лента лежит плоско на земле
-	local side = FWD:Cross(Vector3.yAxis).Unit
+	local side = CONFIG.FORWARD_LOCAL:Cross(Vector3.yAxis).Unit
 	local ground = localPos + Vector3.new(0, -r + 0.06, 0)
 
 	local a0 = Instance.new("Attachment")
@@ -853,18 +843,18 @@ local function buildSmoke()
 
 	-- нет своего дыма в модели — делаем дым у заднего колеса (идёт пока включено вилли)
 	if #list == 0 then
-		local fwd = root.CFrame:VectorToWorldSpace(FWD)
+		local fwd = root.CFrame:VectorToWorldSpace(CONFIG.FORWARD_LOCAL)
 		local rear = getRearWheel(fwd)
 		local pos
 		if rear then
 			local r = math.max(rear.Size.X, rear.Size.Y, rear.Size.Z) / 2
 			pos = root.CFrame:PointToObjectSpace(rear.Position) + Vector3.new(0, -r * 0.6, 0)
 		else
-			pos = -FWD * (math.max(root.Size.X, root.Size.Z) / 2) + Vector3.new(0, -root.Size.Y / 2, 0)
+			pos = -CONFIG.FORWARD_LOCAL * (math.max(root.Size.X, root.Size.Z) / 2) + Vector3.new(0, -root.Size.Y / 2, 0)
 		end
 		local att = Instance.new("Attachment")
 		att.Name = "GIGA_SmokeAtt"
-		att.CFrame = CFrame.lookAt(pos, pos - FWD)
+		att.CFrame = CFrame.lookAt(pos, pos - CONFIG.FORWARD_LOCAL)
 		att.Parent = root
 
 		local e = Instance.new("ParticleEmitter")
@@ -993,50 +983,11 @@ end)
 
 ---------------------------------------------------------------
 -- ВИЛЛИ (F)
--- Каждый кадр (Stepped = ДО физики) доводим тангаж самоката до целевого угла,
--- вращая его вокруг оси заднего колеса, чтобы колесо не вдавливалось в землю.
--- Пока вилли включено, "стабилизаторы" игры (BodyGyro/AlignOrientation) выключены.
 ---------------------------------------------------------------
-function wheelie.hold()
-	local s = scooter
-	if not s or not CONFIG.DISABLE_STABILIZERS then return end
-	for _, d in ipairs(s:GetDescendants()) do
-		if not wheelie.stab[d] and not isFx(d) then
-			if d:IsA("BodyGyro") then
-				wheelie.stab[d] = d.MaxTorque
-				d.MaxTorque = Vector3.zero
-			elseif d:IsA("AlignOrientation") then
-				wheelie.stab[d] = d.Enabled
-				d.Enabled = false
-			end
-		end
-	end
-end
-
-function wheelie.release()
-	for d, saved in pairs(wheelie.stab) do
-		if d.Parent then
-			pcall(function()
-				if typeof(saved) == "Vector3" then
-					d.MaxTorque = saved
-				else
-					d.Enabled = saved
-				end
-			end)
-		end
-	end
-	wheelie.stab = {}
-end
-
 local function setWheelie(on)
 	wheelie.on = on
 	if wheelieToggleUI then wheelieToggleUI.set(on) end
 	if smoke.own then smoke.own.Enabled = on end
-	if on then
-		ensure()
-		if not scooter and notify then notify("Scooter not found") end
-		wheelie.hold()
-	end
 end
 
 local function stepWheelie(dt)
@@ -1045,14 +996,13 @@ local function stepWheelie(dt)
 	wheelie.target = wheelie.target + math.clamp(goal - wheelie.target, -maxStep, maxStep)
 	if not wheelie.on and wheelie.target < 0.05 then
 		wheelie.target = 0
-		if next(wheelie.stab) then wheelie.release() end
 		return
 	end
 
 	local root = getRoot()
 	if not root or root.Anchored then return end
 
-	local fwd = root.CFrame:VectorToWorldSpace(FWD).Unit
+	local fwd = root.CFrame:VectorToWorldSpace(CONFIG.FORWARD_LOCAL).Unit
 	local right = fwd:Cross(Vector3.yAxis)
 	if right.Magnitude < 0.1 then return end
 	right = right.Unit
@@ -1060,27 +1010,20 @@ local function stepWheelie(dt)
 	local pitch = math.deg(math.asin(math.clamp(fwd.Y, -1, 1)))
 	local err = wheelie.target - pitch
 
-	local w = root.AssemblyAngularVelocity
-	local rate = w:Dot(right)
-	local want = math.clamp(math.rad(err) * CONFIG.WHEELIE_POWER, -5, 5)
-	local newRate = rate + (want - rate) * math.clamp(dt * 30, 0, 1)
-	local newW = w + right * (newRate - rate)
+	local rate = root.AssemblyAngularVelocity:Dot(right)
+	local want = math.clamp(math.rad(err) * CONFIG.WHEELIE_POWER, -4, 4)
+	local newRate = rate + (want - rate) * math.clamp(dt * 12, 0, 1)
+	local dW = right * (newRate - rate)
 
+	root.AssemblyAngularVelocity = root.AssemblyAngularVelocity + dW
+
+	-- вращаем вокруг оси заднего колеса, чтобы оно не вдавливалось в землю
 	local rear = getRearWheel(fwd)
 	if rear then
-		-- скорость заднего колеса не меняем: вращаемся вокруг него
-		local com = root.AssemblyCenterOfMass
-		local vRear = root.AssemblyLinearVelocity + w:Cross(rear.Position - com)
-		root.AssemblyAngularVelocity = newW
-		root.AssemblyLinearVelocity = vRear + newW:Cross(com - rear.Position)
-	else
-		root.AssemblyAngularVelocity = newW
+		root.AssemblyLinearVelocity = root.AssemblyLinearVelocity
+			+ dW:Cross(root.AssemblyCenterOfMass - rear.Position)
 	end
 end
-
-connect(RS.Stepped, function(_, dt)
-	stepWheelie(dt)
-end)
 
 ---------------------------------------------------------------
 -- ПРИМЕНИТЬ ВСЁ + watchdog (респавн самоката, посадка/слезание)
@@ -1093,7 +1036,7 @@ local function applyAll()
 	buildGlow()
 	buildTrail()
 	buildSmoke()
-	if state.wheelieBar and scooter and not scooter:FindFirstChild(BAR_FOLDER) then
+	if state.wheelieBar and scooter and not scooter:FindFirstChild("WheelieBarAdded") then
 		buildWheelieBar()
 	end
 	local total = 0
@@ -1109,15 +1052,18 @@ end
 
 local appliedTo, wdAcc = nil, 1
 connect(RS.Heartbeat, function(dt)
+	stepWheelie(dt)
+
 	wdAcc += dt
 	if wdAcc < 0.25 then return end
 	wdAcc = 0
 
 	ensure()
 	local s = scooter
+	riding = (s ~= nil) and isRiding()
 
 	if s ~= appliedTo then
-		wheelie.stab = {}
+		if freeze.on then resetFreezeState() end
 		appliedTo = s
 		if s then
 			cleanupOld()
@@ -1128,8 +1074,8 @@ connect(RS.Heartbeat, function(dt)
 	elseif s then
 		if state.underglow and (not glow.part or not glow.part.Parent or glow.root ~= rootPart) then buildGlow() end
 		if state.trail and (not trail.obj or not trail.obj.Parent) then buildTrail() end
-		if state.wheelieBar and not s:FindFirstChild(BAR_FOLDER) then buildWheelieBar() end
-		if wheelie.on then wheelie.hold() end
+		if state.wheelieBar and not s:FindFirstChild("WheelieBarAdded") then buildWheelieBar() end
+		if freeze.on then checkFreeze() end
 	end
 
 	if updateStatus then updateStatus() end
@@ -1869,6 +1815,16 @@ do
 	wheelieToggleUI = makeToggle(r, false, function(on) setWheelie(on) end)
 end
 
+do
+	local r = row(customPage, "Freeze Scooter [" .. (CONFIG.FREEZE_KEY.Name:gsub("^Left", "")) .. "]")
+	freezeToggleUI = makeToggle(r, false, function(on)
+		if not setFreeze(on) then
+			freezeToggleUI.set(false)
+			notify("Sit on the scooter first")
+		end
+	end)
+end
+
 local wbButton
 do
 	local r = row(customPage, "Wheelie Bar")
@@ -1880,29 +1836,27 @@ do
 	corner(wbButton, 6)
 	wbButton.MouseButton1Click:Connect(function()
 		ensure()
-		if not scooter then
-			notify("Scooter not found")
+		if #groups.WheelieBar > 0 then return end
+		if not isRiding() then
+			notify("Sit on the scooter to add the wheelie bar")
 			return
 		end
-		if scooter:FindFirstChild(BAR_FOLDER) then return end -- уже добавлен
 		if buildWheelieBar() then
 			state.wheelieBar = true
 			ensure()
 			if wbButtonUpdate then wbButtonUpdate() end
 			notify("Wheelie bar added")
-		else
-			notify("Could not add the wheelie bar")
 		end
 	end)
 end
 
 wbButtonUpdate = function()
 	if not wbButton then return end
-	if scooter and scooter:FindFirstChild(BAR_FOLDER) then
+	if #groups.WheelieBar > 0 then
 		wbButton.Text = "DONE"
 		wbButton.BackgroundTransparency = 1
 		wbButton.TextColor3 = C.text
-	elseif scooter then
+	elseif riding then
 		wbButton.Text = "ADD"
 		wbButton.BackgroundTransparency = 0
 		wbButton.BackgroundColor3 = C.accent
@@ -2348,12 +2302,11 @@ end
 updateStatus()
 
 ---------------------------------------------------------------
--- ВВОД: F = вилли, RightShift = меню
--- (клавиши работают, даже если игра сама "съела" нажатие; не работают только во время ввода в TextBox)
+-- ВВОД: F = вилли, Shift = заморозка, RightShift = меню
 ---------------------------------------------------------------
-connect(UIS.InputBegan, function(input)
+connect(UIS.InputBegan, function(input, processed)
+	if processed then return end
 	if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
-	if UIS:GetFocusedTextBox() then return end
 
 	if input.KeyCode == CONFIG.MENU_KEY then
 		setMenuVisible(not main.Visible)
@@ -2362,6 +2315,12 @@ connect(UIS.InputBegan, function(input)
 			setWheelie(true)
 		else
 			setWheelie(not wheelie.on)
+		end
+	elseif input.KeyCode == CONFIG.FREEZE_KEY then
+		if setFreeze(not freeze.on) then
+			notify(freeze.on and "Scooter frozen" or "Scooter unfrozen")
+		else
+			notify("Sit on the scooter first")
 		end
 	end
 end)
@@ -2378,5 +2337,5 @@ end)
 -- СТАРТ
 ---------------------------------------------------------------
 showPage("Presets")
-warn("[GIGAMENU v2.1] loaded — by zyru | " .. CONFIG.WHEELIE_KEY.Name .. " = wheelie, "
-	.. CONFIG.MENU_KEY.Name .. " = menu")
+warn("[GIGAMENU v2.0] loaded — by zyru | " .. CONFIG.WHEELIE_KEY.Name .. " = wheelie, "
+	.. CONFIG.FREEZE_KEY.Name .. " = freeze, " .. CONFIG.MENU_KEY.Name .. " = menu")
